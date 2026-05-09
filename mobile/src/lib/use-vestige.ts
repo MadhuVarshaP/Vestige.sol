@@ -1,0 +1,561 @@
+import { useCallback } from 'react';
+import { Connection, Keypair, PublicKey } from '@solana/web3.js';
+import {
+  getAssociatedTokenAddressSync,
+} from '@solana/spl-token';
+import { BN } from '@coral-xyz/anchor';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useWallet } from './use-wallet';
+import {
+  VestigeClient,
+  LaunchData,
+  UserPositionData,
+} from './vestige-client';
+import {
+  buildBuyTx,
+  buildSellTx,
+  buildGraduateTx,
+  buildGraduateToDexTx,
+  buildClaimBonusTx,
+  buildCreatorClaimFeesTx,
+  buildAdvanceMilestoneTx,
+  buildInitializeLaunchTx,
+  RAYDIUM_DEVNET_AMM_CONFIG,
+  RAYDIUM_DEVNET_CREATE_POOL_FEE,
+  deriveRaydiumCpmmAccounts,
+} from './vestige-transactions';
+import { RPC_ENDPOINT, CONNECTION_CONFIG } from '../constants/solana';
+
+// ============== Simulation diagnostic ==============
+
+const VESTIGE_ERRORS: Record<number, string> = {
+  6009: 'LaunchNotStarted — buy called before start_time',
+  6010: 'LaunchEnded — launch period has expired',
+  6011: 'AlreadyGraduated — launch is already graduated',
+  6012: 'InvalidSolAmount — sol_amount must be > 0',
+  6013: 'ZeroBaseTokens — buy too small for current price',
+  6014: 'ZeroCurvePrice — curve price is zero',
+  6015: 'TokenSupplyExceeded',
+  6016: 'BonusPoolExceeded',
+  6017: 'GraduationConditionsNotMet — target not reached and time not expired',
+  6026: 'Overflow',
+  6027: 'CreatorMustBuyFirst — non-creator tried to buy before initial buy',
+  6028: 'InitialBuyTooSmall — initial buy must be >= 0.01 SOL',
+  6036: 'InvalidRaydiumProgram — wrong CPMM program address',
+  6037: 'PoolAlreadyCreated — Raydium pool already exists',
+  6038: 'InsufficientPoolLiquidity — vault has 0 SOL or 0 tokens available for pool',
+};
+
+async function simulateAndLog(connection: Connection, tx: any, label: string) {
+  try {
+    const result = await connection.simulateTransaction(tx, undefined, true);
+    const logs = result.value.logs ?? [];
+    if (result.value.err) {
+      const errJson = JSON.stringify(result.value.err);
+      // Parse Anchor/Vestige custom error code
+      const match = errJson.match(/"Custom":(\d+)/);
+      const code = match ? parseInt(match[1]) : null;
+      const name = code ? (VESTIGE_ERRORS[code] ?? `Custom(${code})`) : errJson;
+      console.error(`[${label}] Simulation FAILED: ${name}`);
+      console.error(`[${label}] Logs:\n  ${logs.slice(-10).join('\n  ')}`);
+      return name;
+    }
+    console.log(`[${label}] Simulation OK`);
+    return null;
+  } catch (e: any) {
+    console.warn(`[${label}] simulateTransaction threw: ${e?.message}`);
+    return null;
+  }
+}
+
+// ============== Shared singleton (module-level) ==============
+
+let _sharedConnection: Connection | null = null;
+let _sharedClient: VestigeClient | null = null;
+
+function getSharedConnection(): Connection {
+  if (!_sharedConnection) {
+    _sharedConnection = new Connection(RPC_ENDPOINT, CONNECTION_CONFIG);
+  }
+  return _sharedConnection;
+}
+
+function getSharedClient(): VestigeClient {
+  if (!_sharedClient) {
+    _sharedClient = new VestigeClient(getSharedConnection());
+  }
+  return _sharedClient;
+}
+
+// ============== Launch PDA persistence ==============
+// Stores known launch PDAs in AsyncStorage so we don't need getProgramAccounts
+// to display launches. Individual getAccountInfo calls are much cheaper.
+
+const STORAGE_KEY = 'vestige_known_launch_pdas';
+
+async function loadKnownPdas(): Promise<string[]> {
+  try {
+    const raw = await AsyncStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function saveKnownPdas(pdas: string[]): Promise<void> {
+  try {
+    await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(pdas));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+async function addKnownPda(pda: string): Promise<void> {
+  const existing = await loadKnownPdas();
+  if (!existing.includes(pda)) {
+    existing.push(pda);
+    await saveKnownPdas(existing);
+  }
+}
+
+// ============== Cache ==============
+
+const CACHE_TTL = 30_000; // 30 seconds
+
+let _launchCache: LaunchData[] = [];
+let _launchCacheTime = 0;
+let _launchInflight: Promise<LaunchData[]> | null = null;
+
+/**
+ * Fetches launches using a two-tier strategy:
+ *
+ * 1. FAST PATH (always): Fetch known PDAs from AsyncStorage, then fetch each
+ *    individually via getAccountInfo (cheap, ~1 RPC call per account, batched).
+ *
+ * 2. SLOW PATH (background, when forced): Also run getProgramAccounts to
+ *    discover new launches from other users. Merge results and save new PDAs.
+ */
+async function cachedGetAllLaunches(force = false): Promise<LaunchData[]> {
+  const now = Date.now();
+
+  // Return cache if fresh
+  if (!force && _launchCache.length > 0 && now - _launchCacheTime < CACHE_TTL) {
+    return _launchCache;
+  }
+
+  // Deduplicate in-flight requests
+  if (_launchInflight) {
+    return _launchInflight;
+  }
+
+  _launchInflight = (async () => {
+    const client = getSharedClient();
+    const knownPdas = await loadKnownPdas();
+    console.log(`[Vestige] Known PDAs in storage: ${knownPdas.length}`);
+
+    // FAST PATH: fetch known launches individually (cheap getAccountInfo calls)
+    const knownLaunches: LaunchData[] = [];
+    if (knownPdas.length > 0) {
+      // Fetch in parallel batches of 5
+      const BATCH = 5;
+      for (let i = 0; i < knownPdas.length; i += BATCH) {
+        const batch = knownPdas.slice(i, i + BATCH);
+        const results = await Promise.allSettled(
+          batch.map((pda) => client.getLaunch(new PublicKey(pda)))
+        );
+        for (const r of results) {
+          if (r.status === 'fulfilled' && r.value) {
+            knownLaunches.push(r.value);
+          }
+        }
+      }
+      console.log(`[Vestige] Fetched ${knownLaunches.length}/${knownPdas.length} known launches`);
+    }
+
+    // If we have known launches, update cache immediately so screens can display
+    if (knownLaunches.length > 0) {
+      _launchCache = knownLaunches;
+      _launchCacheTime = Date.now();
+    }
+
+    // SLOW PATH: try getProgramAccounts to discover new launches
+    // Only do this if forced (pull-to-refresh) or we have no known PDAs
+    if (force || knownPdas.length === 0) {
+      try {
+        const allLaunches = await client.getAllLaunches();
+        console.log(`[Vestige] getProgramAccounts found ${allLaunches.length} total launches`);
+
+        // Merge: use getProgramAccounts results as the authoritative list
+        if (allLaunches.length > 0) {
+          _launchCache = allLaunches;
+          _launchCacheTime = Date.now();
+
+          // Save all discovered PDAs for future fast-path fetches
+          const allPdaStrs = allLaunches.map((l) => l.publicKey.toBase58());
+          await saveKnownPdas(allPdaStrs);
+        }
+      } catch (err: any) {
+        console.warn(`[Vestige] getProgramAccounts failed: ${err?.message}`);
+        // Fall through — we already have knownLaunches from fast path
+      }
+    }
+
+    return _launchCache;
+  })()
+    .catch((err) => {
+      console.warn(`[Vestige] Launch fetch failed entirely: ${err?.message}`);
+      return _launchCache; // return whatever stale data we have
+    })
+    .finally(() => {
+      _launchInflight = null;
+    });
+
+  return _launchInflight;
+}
+
+/** Invalidate the launch cache (call after creating/modifying a launch) */
+export function invalidateLaunchCache() {
+  _launchCacheTime = 0;
+}
+
+// ============== Hook ==============
+
+export function useVestige() {
+  const { publicKey, signAndSendTransaction } = useWallet();
+
+  const getConnection = useCallback(() => getSharedConnection(), []);
+  const getClient = useCallback(() => getSharedClient(), []);
+
+  // ============== Read Operations ==============
+
+  const getAllLaunches = useCallback(
+    async (force = false): Promise<LaunchData[]> => {
+      return cachedGetAllLaunches(force);
+    },
+    []
+  );
+
+  const getLaunch = useCallback(
+    async (launchPda: PublicKey): Promise<LaunchData | null> => {
+      return getClient().getLaunch(launchPda);
+    },
+    [getClient]
+  );
+
+  const getUserPosition = useCallback(
+    async (
+      launchPda: PublicKey,
+      user: PublicKey
+    ): Promise<UserPositionData | null> => {
+      return getClient().getUserPosition(launchPda, user);
+    },
+    [getClient]
+  );
+
+  const getBalance = useCallback(
+    async (wallet: PublicKey): Promise<number> => {
+      return getClient().getBalance(wallet);
+    },
+    [getClient]
+  );
+
+  // ============== Write Operations ==============
+
+  const buy = useCallback(
+    async (launchPda: PublicKey, launch: LaunchData, solAmount: number) => {
+      if (!publicKey) throw new Error('Wallet not connected');
+
+      const connection = getConnection();
+      const client = getClient();
+      const lamports = VestigeClient.solToLamports(solAmount);
+
+      const tokenVault = getAssociatedTokenAddressSync(
+        launch.tokenMint,
+        launchPda,
+        true
+      );
+      const userTokenAccount = getAssociatedTokenAddressSync(
+        launch.tokenMint,
+        publicKey
+      );
+
+      const tx = await buildBuyTx(
+        client.program,
+        connection,
+        launchPda,
+        lamports,
+        publicKey,
+        tokenVault,
+        userTokenAccount,
+        launch.tokenMint
+      );
+
+      // Diagnostic: simulate before sending so Metro shows the exact error
+      const simError = await simulateAndLog(connection, tx, 'Buy');
+      if (simError) {
+        throw new Error(`Buy simulation failed: ${simError}`);
+      }
+
+      const signature = await signAndSendTransaction(tx);
+      invalidateLaunchCache();
+      return signature;
+    },
+    [publicKey, getConnection, getClient, signAndSendTransaction]
+  );
+
+  const graduate = useCallback(
+    async (launchPda: PublicKey) => {
+      if (!publicKey) throw new Error('Wallet not connected');
+
+      const connection = getConnection();
+      const client = getClient();
+
+      const tx = await buildGraduateTx(
+        client.program,
+        connection,
+        launchPda,
+        publicKey
+      );
+
+      const signature = await signAndSendTransaction(tx);
+      invalidateLaunchCache();
+      return signature;
+    },
+    [publicKey, getConnection, getClient, signAndSendTransaction]
+  );
+
+  const graduateToDex = useCallback(
+    async (launchPda: PublicKey, launch: LaunchData) => {
+      if (!publicKey) throw new Error('Wallet not connected');
+
+      const connection = getConnection();
+      const client = getClient();
+
+      const tokenVault = getAssociatedTokenAddressSync(
+        launch.tokenMint,
+        launchPda,
+        true
+      );
+
+      // Fetch vault SOL (tokens are always exactly lp_reserve — fixed at init)
+      const [vaultPda] = VestigeClient.deriveVaultPda(launchPda);
+      const [vaultInfo, rentExemptMin] = await Promise.all([
+        connection.getAccountInfo(vaultPda),
+        connection.getMinimumBalanceForRentExemption(0),
+      ]);
+
+      if (!vaultInfo) throw new Error('Vault account not found');
+
+      const solForPool = new BN(vaultInfo.lamports - rentExemptMin);
+      // tokensForPool is always lp_reserve — stored in launch state at init
+      const tokensForPool = launch.lpReserve;
+
+      if (solForPool.lten(0)) throw new Error('Insufficient SOL in vault for pool creation');
+      if (tokensForPool.lten(0)) throw new Error('Insufficient tokens in vault for pool creation');
+
+      const tx = await buildGraduateToDexTx(
+        client.program,
+        connection,
+        launchPda,
+        publicKey,
+        launch.tokenMint,
+        tokenVault,
+        solForPool,
+        tokensForPool,
+        RAYDIUM_DEVNET_AMM_CONFIG,
+        RAYDIUM_DEVNET_CREATE_POOL_FEE,
+      );
+
+      // Diagnostic: simulate before sending so Metro shows the exact error
+      const simError = await simulateAndLog(connection, tx, 'GraduateToDex');
+      if (simError) {
+        throw new Error(`GraduateToDex simulation failed: ${simError}`);
+      }
+
+      const signature = await signAndSendTransaction(tx);
+      invalidateLaunchCache();
+      return signature;
+    },
+    [publicKey, getConnection, getClient, signAndSendTransaction]
+  );
+
+  const claimBonus = useCallback(
+    async (launchPda: PublicKey, launch: LaunchData) => {
+      if (!publicKey) throw new Error('Wallet not connected');
+
+      const connection = getConnection();
+      const client = getClient();
+
+      const tokenVault = getAssociatedTokenAddressSync(
+        launch.tokenMint,
+        launchPda,
+        true
+      );
+      const userTokenAccount = getAssociatedTokenAddressSync(
+        launch.tokenMint,
+        publicKey
+      );
+
+      const tx = await buildClaimBonusTx(
+        client.program,
+        connection,
+        launchPda,
+        publicKey,
+        tokenVault,
+        userTokenAccount
+      );
+
+      const signature = await signAndSendTransaction(tx);
+      return signature;
+    },
+    [publicKey, getConnection, getClient, signAndSendTransaction]
+  );
+
+  const creatorClaimFees = useCallback(
+    async (launchPda: PublicKey) => {
+      if (!publicKey) throw new Error('Wallet not connected');
+
+      const connection = getConnection();
+      const client = getClient();
+
+      const tx = await buildCreatorClaimFeesTx(
+        client.program,
+        connection,
+        launchPda,
+        publicKey
+      );
+
+      const signature = await signAndSendTransaction(tx);
+      return signature;
+    },
+    [publicKey, getConnection, getClient, signAndSendTransaction]
+  );
+
+  const advanceMilestone = useCallback(
+    async (launchPda: PublicKey) => {
+      if (!publicKey) throw new Error('Wallet not connected');
+
+      const connection = getConnection();
+      const client = getClient();
+
+      const tx = await buildAdvanceMilestoneTx(
+        client.program,
+        connection,
+        launchPda,
+        publicKey
+      );
+
+      const signature = await signAndSendTransaction(tx);
+      invalidateLaunchCache();
+      return signature;
+    },
+    [publicKey, getConnection, getClient, signAndSendTransaction]
+  );
+
+  const sell = useCallback(
+    async (launchPda: PublicKey, launch: LaunchData, tokenAmount: number) => {
+      if (!publicKey) throw new Error('Wallet not connected');
+
+      const connection = getConnection();
+      const client = getClient();
+      const amount = new BN(tokenAmount);
+
+      const tokenVault = getAssociatedTokenAddressSync(
+        launch.tokenMint,
+        launchPda,
+        true
+      );
+      const userTokenAccount = getAssociatedTokenAddressSync(
+        launch.tokenMint,
+        publicKey
+      );
+
+      const tx = await buildSellTx(
+        client.program,
+        connection,
+        launchPda,
+        amount,
+        publicKey,
+        tokenVault,
+        userTokenAccount,
+      );
+
+      const signature = await signAndSendTransaction(tx);
+      invalidateLaunchCache();
+      return signature;
+    },
+    [publicKey, getConnection, getClient, signAndSendTransaction]
+  );
+
+  const initializeLaunch = useCallback(
+    async (
+      mintKeypair: Keypair,
+      tokenSupply: BN,
+      bonusPool: BN,
+      lpReserve: BN,
+      startTime: BN,
+      endTime: BN,
+      rBest: BN,
+      rMin: BN,
+      graduationTarget: BN,
+      name: string,
+      symbol: string,
+      uri: string,
+    ) => {
+      if (!publicKey) throw new Error('Wallet not connected');
+
+      const connection = getConnection();
+      const client = getClient();
+
+      const tx = await buildInitializeLaunchTx(
+        client.program,
+        connection,
+        mintKeypair,
+        publicKey,
+        tokenSupply,
+        bonusPool,
+        lpReserve,
+        startTime,
+        endTime,
+        rBest,
+        rMin,
+        graduationTarget,
+        name,
+        symbol,
+        uri,
+      );
+
+      const signature = await signAndSendTransaction(tx, [mintKeypair]);
+
+      // Immediately persist the new launch PDA so it shows up in Discovery
+      const [launchPda] = VestigeClient.deriveLaunchPda(
+        publicKey,
+        mintKeypair.publicKey
+      );
+      await addKnownPda(launchPda.toBase58());
+      invalidateLaunchCache();
+
+      return signature;
+    },
+    [publicKey, getConnection, getClient, signAndSendTransaction]
+  );
+
+  return {
+    // Read
+    getAllLaunches,
+    getLaunch,
+    getUserPosition,
+    getBalance,
+    // Write
+    buy,
+    sell,
+    graduate,
+    graduateToDex,
+    claimBonus,
+    creatorClaimFees,
+    advanceMilestone,
+    initializeLaunch,
+    // Helpers
+    client: getClient(),
+  };
+}
